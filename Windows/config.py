@@ -7,6 +7,62 @@
 DEFAULT_BAUD  = 9600
 DEFAULT_DELAY = 0.12    # seconds to wait between consecutive serial writes
 
+# ── Discord integration ───────────────────────────────────────────────────────
+# Paste your Discord webhook URL here, or leave blank and enter it in the UI.
+# Format: https://discord.com/api/webhooks/<id>/<token>
+
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1494356518009831464/WwkZ_kH3KbgdkzYwxdG3K6jz1X_yMkSE2b1k7micNTq7F5ff4bDtzhdTTbi8Tfgg_Z5a"
+# ── Always-on monitor settings ────────────────────────────────────────────────
+
+RESOURCE_POLL_INTERVAL  = 5.0    # seconds between CPU/RAM/disk polls
+PROCESS_SCAN_INTERVAL   = 60.0   # seconds between process whitelist scans
+SECURITY_SCAN_INTERVAL  = 600.0  # seconds between full firewall/port scans (10 min)
+
+# Alert thresholds — Discord notification fires when usage exceeds these values
+CPU_ALERT_THRESHOLD      = 85.0   # percent
+RAM_ALERT_THRESHOLD      = 90.0   # percent
+DISK_ALERT_THRESHOLD     = 90.0   # percent
+PROCESS_RISK_THRESHOLD   = 60     # heuristic score 0–100; only alert above this
+
+# Ports that trigger a "high-risk" flag in the security monitor
+HIGH_RISK_PORTS_SET = frozenset({
+    21, 22, 23, 25, 53, 80, 135, 137, 138, 139,
+    443, 445, 1433, 3306, 3389, 5985, 5986, 8080, 8443,
+})
+
+# ── Known-safe process whitelist ───────────────────────────────────────────────
+# Process names here (lowercase, filename only, no path) are considered trusted.
+# Anything NOT in this set gets flagged as "unknown" — not necessarily malicious,
+# but worth a manual review. Add your own regularly-used apps as needed.
+#
+# This is the single source of truth for "safe process names" across the app:
+#   - security_scan.scan_processes() uses it to filter the flagged list.
+#   - heuristic._SAFE_BASE_NAMES is derived from it (extensions stripped)
+#     for typosquat distance checks.
+
+KNOWN_SAFE_PROCESSES = frozenset({
+    # Core Windows system processes
+    "system", "system idle process", "registry", "smss.exe", "csrss.exe",
+    "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe",
+    "dwm.exe", "explorer.exe", "taskhostw.exe", "sihost.exe", "fontdrvhost.exe",
+    "ctfmon.exe", "spoolsv.exe", "searchindexer.exe", "wuauclt.exe",
+    "msiexec.exe", "conhost.exe", "dllhost.exe", "runtimebroker.exe",
+    "applicationframehost.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "securityhealthservice.exe",
+    "securityhealthsystray.exe", "msmpeng.exe", "nissrv.exe",
+    "smartscreen.exe", "wlanext.exe", "audiodg.exe", "dashost.exe",
+    "wermgr.exe", "wevtutil.exe",
+    # Common browsers & productivity apps
+    "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe",
+    "code.exe", "python.exe", "pythonw.exe", "cmd.exe", "powershell.exe",
+    "windowsterminal.exe", "notepad.exe", "notepad++.exe", "7zfm.exe",
+    "discord.exe", "slack.exe", "teams.exe", "zoom.exe", "spotify.exe",
+    "onedrive.exe", "dropbox.exe", "googledrivefs.exe",
+    "taskmgr.exe", "mmc.exe", "regedit.exe", "mspaint.exe", "calc.exe",
+    # Dev / serial / network tools commonly used with this project
+    "thonny.exe", "putty.exe", "hxd.exe", "wireshark.exe",
+})
+
 # ── Network quality polling ───────────────────────────────────────────────────
 
 PING_HOST      = "8.8.8.8"
@@ -39,7 +95,6 @@ PAGE_REFRESH_MAP = {
     "dashboard": ["page_dashboard_refresh"],
     "network":   ["page_network_refresh"],
     "portscan":  ["page_portscan_refresh"],
-    "procs":     ["page_procs_refresh"],
     "lock":      ["page_lock_refresh"],
 }
 

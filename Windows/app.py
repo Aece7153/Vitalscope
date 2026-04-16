@@ -19,10 +19,15 @@ from config import (
     PAGE_REFRESH_MAP,
     BG, BG2, BG3, BORDER, ACCENT, ACCENT2, GREEN, RED, YELLOW, TEXT, TEXT_DIM,
     FONT_MONO, FONT_MONO_SM, FONT_LABEL, FONT_HEAD, FONT_TITLE,
+    DISCORD_WEBHOOK_URL,
+    CPU_ALERT_THRESHOLD, RAM_ALERT_THRESHOLD, DISK_ALERT_THRESHOLD,
+    PROCESS_RISK_THRESHOLD,
 )
-from ui_widgets import styled_btn, styled_entry, styled_label, section_frame, ElementCard
+from ui_widgets import styled_btn, styled_entry, styled_label, section_frame
 from pages import PageHandlersMixin
 from security_scan import SecurityScanWindow
+from monitor import SystemMonitor
+import discord_notifier as dn
 
 
 class NextionControlStation(PageHandlersMixin):
@@ -49,14 +54,24 @@ class NextionControlStation(PageHandlersMixin):
         self.active_page_var = tk.StringVar(value="--")
         self.status_var      = tk.StringVar(value="DISCONNECTED")
         self._current_page   = None                 # name of the active Nextion page
-        self.element_cards   = []                   # live ElementCard instances
+
+        # ── Discord / monitor config ──────────────────────────────────────────
+        self.webhook_var      = tk.StringVar(value=DISCORD_WEBHOOK_URL)
+        self.cpu_thresh_var   = tk.DoubleVar(value=CPU_ALERT_THRESHOLD)
+        self.ram_thresh_var   = tk.DoubleVar(value=RAM_ALERT_THRESHOLD)
+        self.disk_thresh_var  = tk.DoubleVar(value=DISK_ALERT_THRESHOLD)
+        self.proc_thresh_var  = tk.IntVar(value=PROCESS_RISK_THRESHOLD)
+
+        # ── Live monitor readouts (StringVars for UI labels) ──────────────────
+        self.mon_cpu_var      = tk.StringVar(value="CPU:  --")
+        self.mon_ram_var      = tk.StringVar(value="RAM:  --")
+        self.mon_disk_var     = tk.StringVar(value="DISK: --")
+        self.mon_procs_var    = tk.StringVar(value="Procs: --")
+        self.mon_alert_var    = tk.StringVar(value="")
 
         # ── Listener thread ───────────────────────────────────────────────────
         self.running_listener = False
         self.listener_thread  = None
-
-        # ── Auto-send (periodic element refresh) ──────────────────────────────
-        self._auto_thread = None
 
         # ── Network quality loop (network page only) ──────────────────────────
         self._net_running    = False
@@ -71,6 +86,19 @@ class NextionControlStation(PageHandlersMixin):
         self._apply_style()
         self._build_ui()
         self._refresh_ports()
+
+        # ── Always-on system monitor (starts immediately, Nextion-independent) ─
+        self._monitor = SystemMonitor(
+            webhook_url_fn      = lambda: self.webhook_var.get().strip(),
+            risk_threshold_fn   = lambda: self.proc_thresh_var.get(),
+            on_resource_update  = self._on_resource_update,
+            on_resource_alert   = self._on_resource_alert,
+            on_process_scan     = self._on_process_scan,
+            on_high_risk_process = self._on_high_risk_process,
+            on_security_scan    = self._on_security_scan,
+        )
+        self._monitor.start()
+        self._queue_log("System monitor started (always-on).", "ok")
 
     # ── Tkinter style ─────────────────────────────────────────────────────────
 
@@ -106,6 +134,13 @@ class NextionControlStation(PageHandlersMixin):
             tb, textvariable=self.status_var, bg=BG3, fg=TEXT_DIM, font=FONT_MONO,
         ).pack(side="right", padx=4)
 
+        # Security scan launcher — lives in the title bar to the left of the
+        # connection status indicator so it is always reachable without scrolling.
+        styled_btn(
+            tb, "[ RUN SECURITY SCAN ]",
+            self.open_security_scan, color=RED,
+        ).pack(side="right", padx=(0, 12), pady=6)
+
         # 1-pixel accent separator below the title bar
         tk.Frame(self.root, bg=ACCENT, height=1).pack(fill="x")
 
@@ -137,27 +172,18 @@ class NextionControlStation(PageHandlersMixin):
         left_canvas.bind("<MouseWheel>", lambda e: left_canvas.yview_scroll(
             int(-1 * (e.delta / 120)), "units"))
 
-        # Right column — vertical split: element controls (top) | log (bottom)
+        # Right column — log panel takes the full right side
         right_outer = tk.Frame(h_pane, bg=BG)
         h_pane.add(right_outer, weight=1)
 
-        v_pane = ttk.PanedWindow(right_outer, orient="vertical")
-        v_pane.pack(fill="both", expand=True)
-
-        elem_frame = tk.Frame(v_pane, bg=BG)
-        v_pane.add(elem_frame, weight=1)
-
-        log_frame = tk.Frame(v_pane, bg=BG)
-        v_pane.add(log_frame, weight=2)
+        log_frame = tk.Frame(right_outer, bg=BG)
+        log_frame.pack(fill="both", expand=True)
 
         self._build_connection_panel(left)
-        self._build_autosend_panel(left)
+        self._build_monitor_panel(left)
         self._build_setup_panel(left)
         self._build_custom_cmd_panel(left)
-        self._build_scan_launcher(left)
-        self._build_threat_simulator(left)
 
-        self._build_elements_panel(elem_frame)
         self._build_log_panel(log_frame)
 
     def _build_connection_panel(self, parent):
@@ -194,30 +220,176 @@ class NextionControlStation(PageHandlersMixin):
         )
         self.connect_btn.pack(fill="x")
 
-    def _build_autosend_panel(self, parent):
-        """Checkbox + interval spinbox for periodic element re-sends."""
-        outer, body = section_frame(parent, "AUTO-SEND")
+    def _build_monitor_panel(self, parent):
+        """
+        Always-on monitor status display + Discord webhook + AI + threshold config.
+        """
+        outer, body = section_frame(parent, "MONITOR")
         outer.pack(fill="x", pady=(0, 6))
 
-        row = tk.Frame(body, bg=BG2)
-        row.pack(fill="x")
+        # ── Live readout strip ────────────────────────────────────────────────
+        readout = tk.Frame(body, bg=BG3, padx=6, pady=4)
+        readout.pack(fill="x", pady=(0, 6))
 
-        self.auto_var      = tk.BooleanVar(value=False)
-        self.auto_interval = tk.IntVar(value=5)
+        for var in (self.mon_cpu_var, self.mon_ram_var, self.mon_disk_var):
+            tk.Label(readout, textvariable=var, bg=BG3, fg=ACCENT,
+                     font=FONT_MONO_SM, anchor="w").pack(fill="x")
+        tk.Label(readout, textvariable=self.mon_procs_var, bg=BG3, fg=TEXT_DIM,
+                 font=FONT_MONO_SM, anchor="w").pack(fill="x")
+        self._mon_alert_label = tk.Label(readout, textvariable=self.mon_alert_var,
+                                          bg=BG3, fg=RED, font=FONT_MONO_SM, anchor="w")
+        self._mon_alert_label.pack(fill="x")
 
-        tk.Checkbutton(
-            row, text="Auto-send all every", variable=self.auto_var,
-            bg=BG2, fg=TEXT_DIM, activebackground=BG2, selectcolor=BG3,
-            font=FONT_MONO_SM, command=self._toggle_auto,
-        ).pack(side="left")
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(0, 6))
 
-        tk.Spinbox(
-            row, from_=1, to=60, width=3, textvariable=self.auto_interval,
-            bg=BG3, fg=ACCENT, insertbackground=ACCENT,
-            buttonbackground=BG3, relief="flat", font=FONT_MONO_SM,
-        ).pack(side="left", padx=2)
+        # ── Discord webhook URL ───────────────────────────────────────────────
+        styled_label(body, "DISCORD WEBHOOK URL").pack(anchor="w")
+        self.webhook_entry = styled_entry(body, width=32, textvariable=self.webhook_var)
+        self.webhook_entry.pack(fill="x", pady=(2, 4))
 
-        tk.Label(row, text="s", bg=BG2, fg=TEXT_DIM, font=FONT_MONO_SM).pack(side="left")
+        btn_row = tk.Frame(body, bg=BG2)
+        btn_row.pack(fill="x", pady=(0, 6))
+        styled_btn(btn_row, "TEST WEBHOOK", self._test_webhook, color=ACCENT2).pack(side="left")
+        tk.Label(btn_row, text="  sends a test ping", bg=BG2,
+                 fg=TEXT_DIM, font=FONT_MONO_SM).pack(side="left")
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(0, 6))
+
+        # ── Alert thresholds ──────────────────────────────────────────────────
+        styled_label(body, "ALERT THRESHOLDS").pack(anchor="w", pady=(0, 4))
+
+        thresh_grid = tk.Frame(body, bg=BG2)
+        thresh_grid.pack(fill="x")
+
+        # CPU / RAM / DISK rows — spinbox range 50–100, unit is %
+        for row_i, (label, var, lo, hi, unit) in enumerate([
+            ("CPU",       self.cpu_thresh_var,  50, 100, "%"),
+            ("RAM",       self.ram_thresh_var,  50, 100, "%"),
+            ("DISK",      self.disk_thresh_var, 50, 100, "%"),
+            ("PROC RISK", self.proc_thresh_var,  0, 100, "/100"),
+        ]):
+            tk.Label(thresh_grid, text=f"{label}:", bg=BG2, fg=TEXT_DIM,
+                     font=FONT_MONO_SM, width=9, anchor="w").grid(
+                         row=row_i, column=0, sticky="w", pady=1)
+            tk.Spinbox(
+                thresh_grid, from_=lo, to=hi, width=4, textvariable=var,
+                bg=BG3, fg=ACCENT, insertbackground=ACCENT,
+                buttonbackground=BG3, relief="flat", font=FONT_MONO_SM,
+                command=self._apply_monitor_settings,
+            ).grid(row=row_i, column=1, padx=(4, 0), pady=1)
+            tk.Label(thresh_grid, text=unit, bg=BG2, fg=TEXT_DIM,
+                     font=FONT_MONO_SM).grid(row=row_i, column=2, padx=(2, 0))
+
+        styled_btn(body, "APPLY SETTINGS", self._apply_monitor_settings,
+                   color=GREEN).pack(fill="x", pady=(8, 0))
+
+    def _test_webhook(self):
+        """
+        Send a synchronous test POST to the configured Discord webhook and log
+        the exact outcome — success or the specific error — back to the serial log.
+        Runs in a background thread so the UI stays responsive during the request.
+        """
+        url = self.webhook_var.get().strip()
+        if not url:
+            self.log("Discord webhook URL is empty — paste it into the field above.", "error")
+            return
+
+        self.log(f"Testing webhook: {url[:60]}...", "dim")
+
+        def _run():
+            ok, reason = dn.send_webhook(
+                url,
+                title="Nextion Control Station — Connection Test",
+                description=(
+                    "✅ Webhook is working correctly. "
+                    "Alerts from the monitor will appear here."
+                ),
+                severity=dn.SEVERITY_INFO,
+            )
+            if ok:
+                self.root.after(0, self.log,
+                    "Discord test: SUCCESS — check your Discord channel for the message.", "ok")
+            else:
+                self.root.after(0, self.log,
+                    f"Discord test: FAILED\n  {reason}", "error")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_monitor_settings(self):
+        """Push current UI threshold values into the running monitor."""
+        self._monitor.set_thresholds(
+            cpu  = self.cpu_thresh_var.get(),
+            ram  = self.ram_thresh_var.get(),
+            disk = self.disk_thresh_var.get(),
+        )
+        # proc_thresh_var is read live via lambda — no extra push needed
+        self.log(
+            f"Monitor settings applied — "
+            f"CPU>{self.cpu_thresh_var.get():.0f}%  "
+            f"RAM>{self.ram_thresh_var.get():.0f}%  "
+            f"DISK>{self.disk_thresh_var.get():.0f}%  "
+            f"PROC risk>{self.proc_thresh_var.get()}/100",
+            "ok",
+        )
+
+    # ── Monitor callbacks (called from background threads via root.after) ─────
+
+    def _on_resource_update(self, cpu: float, ram: float, disk: float):
+        """Update the live readout strip in the monitor panel."""
+        def _update():
+            self.mon_cpu_var.set(f"CPU:  {cpu:.1f}%")
+            self.mon_ram_var.set(f"RAM:  {ram:.1f}%")
+            self.mon_disk_var.set(f"DISK: {disk:.1f}%")
+            # Also push to Nextion if connected and on dashboard
+            if self.ser and self._current_page in ("dashboard", "main"):
+                self._send_raw_cmd(f'p_cpu.txt="{int(round(cpu))}%"')
+                self._send_raw_cmd(f'g_cpu.val={int(round(cpu))}')
+                self._send_raw_cmd(f'p_ram.txt="{int(round(ram))}%"')
+                self._send_raw_cmd(f'g_ram.val={int(round(ram))}')
+                self._send_raw_cmd(f'p_disk.txt="{int(round(disk))}%"')
+                self._send_raw_cmd(f'g_disk.val={int(round(disk))}')
+        self.root.after(0, _update)
+
+    def _on_resource_alert(self, resource: str, value: float):
+        """Flash the alert label when a threshold is breached."""
+        def _flash():
+            self.mon_alert_var.set(f"⚠ {resource} ALERT: {value:.1f}%")
+            self.root.after(8000, lambda: self.mon_alert_var.set(""))
+        self.root.after(0, _flash)
+        self.root.after(0, self.log, f"[ALERT] {resource} at {value:.1f}% — Discord notified", "error")
+
+    def _on_process_scan(self, high_risk: list, total: int):
+        """Update the process readout — only high-risk processes are shown."""
+        count = len(high_risk)
+        self.root.after(0, self.mon_procs_var.set,
+            f"Procs: {total} running | {count} high-risk")
+        if count > 0:
+            self.root.after(0, self.log,
+                f"[MONITOR] Process scan: {total} total, {count} high-risk flagged", "error")
+        else:
+            self.root.after(0, self.log,
+                f"[MONITOR] Process scan: {total} total, none flagged", "dim")
+
+    def _on_high_risk_process(self, proc: dict):
+        """Log a newly-detected high-risk process with its heuristic breakdown."""
+        name    = proc.get("name", "?")
+        pid     = proc.get("pid", 0)
+        score   = proc.get("score", 0)
+        risk    = proc.get("risk", "?").upper()
+        reasons = proc.get("reasons", [])
+        reason_str = " | ".join(reasons[:3])  # first 3 signals in the log line
+        self.root.after(0, self.log,
+            f"[HEURISTIC] {name} (PID {pid})  score={score}/100  {risk}  — {reason_str}",
+            "error")
+
+    def _on_security_scan(self, fw_data: dict):
+        """Log the security scan result summary."""
+        if fw_data.get("error"):
+            self.root.after(0, self.log, f"[SEC SCAN] Error: {fw_data['error']}", "error")
+            return
+        ports = len(fw_data.get("listeners", []))
+        self.root.after(0, self.log,
+            f"[SEC SCAN] Complete — {ports} listening port(s) found", "info")
 
     def _build_setup_panel(self, parent):
         """Run Setup Sequence button — navigates to a page and sweeps gauges."""
@@ -246,65 +418,6 @@ class NextionControlStation(PageHandlersMixin):
         self.custom_entry.bind("<Return>", lambda e: self._send_custom())
 
         styled_btn(body, "SEND [Enter]", self._send_custom, color=ACCENT).pack(fill="x")
-
-    def _build_elements_panel(self, parent):
-        """ELEMENT CONTROLS panel — add/remove ElementCard rows for Nextion elements."""
-        outer, body = section_frame(parent, "ELEMENT CONTROLS")
-        outer.pack(fill="both", expand=False, pady=(0, 6))
-
-        add_row = tk.Frame(body, bg=BG2)
-        add_row.pack(fill="x", pady=(0, 6))
-
-        styled_label(add_row, "NAME:").pack(side="left", padx=(0, 4))
-        self.elem_name_entry = styled_entry(add_row, width=14)
-        self.elem_name_entry.pack(side="left", padx=(0, 8))
-        self.elem_name_entry.bind("<Return>", lambda e: self._add_element())
-
-        styled_label(add_row, "TYPE:").pack(side="left", padx=(0, 4))
-        self.elem_type_var = tk.StringVar(value=".txt")
-
-        menu = tk.OptionMenu(add_row, self.elem_type_var, ".txt", ".val", ".pco", ".bco")
-        menu.config(
-            bg=BG2, fg=TEXT, activebackground=ACCENT, activeforeground=BG,
-            relief="flat", font=FONT_MONO,
-            highlightthickness=1, highlightbackground=BORDER, bd=0, width=4,
-        )
-        menu["menu"].config(
-            bg=BG2, fg=TEXT, activebackground=ACCENT, activeforeground=BG, font=FONT_MONO,
-        )
-        menu.pack(side="left", padx=(0, 8))
-
-        styled_btn(add_row, "+ ADD",     self._add_element,    color=GREEN).pack(side="left")
-        styled_btn(add_row, "CLEAR ALL", self._clear_elements, color=RED).pack(side="right")
-
-        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(0, 4))
-
-        canvas_frame = tk.Frame(body, bg=BG2)
-        canvas_frame.pack(fill="both", expand=True)
-
-        self.elem_canvas = tk.Canvas(canvas_frame, bg=BG2, highlightthickness=0, height=180)
-        sb = tk.Scrollbar(canvas_frame, orient="vertical", command=self.elem_canvas.yview, bg=BG3)
-        self.elem_canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.elem_canvas.pack(side="left", fill="both", expand=True)
-
-        self.elem_inner = tk.Frame(self.elem_canvas, bg=BG2)
-        self._elem_win  = self.elem_canvas.create_window(
-            (0, 0), window=self.elem_inner, anchor="nw"
-        )
-
-        self.elem_inner.bind(
-            "<Configure>",
-            lambda e: self.elem_canvas.configure(scrollregion=self.elem_canvas.bbox("all")),
-        )
-        self.elem_canvas.bind(
-            "<Configure>",
-            lambda e: self.elem_canvas.itemconfig(self._elem_win, width=e.width),
-        )
-        self.elem_canvas.bind(
-            "<MouseWheel>",
-            lambda e: self.elem_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
-        )
 
     def _build_log_panel(self, parent):
         """
@@ -484,7 +597,6 @@ class NextionControlStation(PageHandlersMixin):
         buffer = bytearray()
 
         def _run():
-            nonlocal buffer
             while self.running_listener:
                 try:
                     if self.ser and self.ser.in_waiting:
@@ -492,8 +604,8 @@ class NextionControlStation(PageHandlersMixin):
 
                         while b'\n' in buffer:
                             idx  = buffer.index(b'\n')
-                            line = buffer[:idx].decode(errors='ignore').strip()
-                            buffer = buffer[idx + 1:]
+                            line = bytes(buffer[:idx]).decode(errors='ignore').strip()
+                            del buffer[:idx + 1]
 
                             if not line:
                                 continue
@@ -667,45 +779,6 @@ class NextionControlStation(PageHandlersMixin):
         if cmd:
             self.send(cmd)
 
-    # ── Element card management ───────────────────────────────────────────────
-
-    def _add_element(self):
-        """
-        Create a new ElementCard from the name entry and type dropdown.
-
-        Validates that a name was entered and that the (name, type) pair is not
-        already present in the panel.
-        """
-        name  = self.elem_name_entry.get().strip()
-        etype = self.elem_type_var.get()
-
-        if not name:
-            messagebox.showwarning("Missing Name", "Enter an element name.")
-            return
-
-        for c in self.element_cards:
-            if c.name == name and c.etype == etype:
-                messagebox.showwarning("Duplicate", f"{name}{etype} already exists.")
-                return
-
-        card = ElementCard(self.elem_inner, name, etype, self.send, self._remove_element)
-        self.element_cards.append(card)
-        self.elem_name_entry.delete(0, "end")
-
-    def _remove_element(self, card):
-        """Destroy an ElementCard widget and remove it from the tracking list."""
-        card.frame.destroy()
-        self.element_cards.remove(card)
-
-    def _clear_elements(self):
-        """Remove all element cards after user confirmation."""
-        if self.element_cards and messagebox.askyesno(
-            "Clear All", "Remove all element controls?"
-        ):
-            for c in list(self.element_cards):
-                c.frame.destroy()
-            self.element_cards.clear()
-
     # ── System metrics ────────────────────────────────────────────────────────
 
     def get_ip(self):
@@ -776,191 +849,19 @@ class NextionControlStation(PageHandlersMixin):
         self.send(f'g_disk.pco={self._gauge_color(disk)}')
 
     def send_all_sys(self):
-        """Push IP, CPU, RAM, and disk in one call (used by auto-send loop)."""
+        """Push IP, CPU, RAM, and disk in one call."""
         self.send_ip()
         self.send_cpu()
         self.send_ram()
         self.send_disk()
 
-    # ── Auto-send ─────────────────────────────────────────────────────────────
-
-    AUTO_SEND_MAP = {
-        "main":      "send_all_sys",
-        "dashboard": "send_all_sys",
-    }
-
-    def _toggle_auto(self):
-        """Start the auto-send loop when the checkbox is ticked."""
-        if self.auto_var.get():
-            self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
-            self._auto_thread.start()
-
-    def _auto_loop(self):
-        """
-        Periodically call the page's send function while auto-send is enabled.
-
-        Sleeps in 0.1-second increments so the loop exits promptly when the
-        checkbox is cleared.
-        """
-        while self.auto_var.get():
-            fn_name = self.AUTO_SEND_MAP.get(self._current_page)
-            if fn_name:
-                fn = getattr(self, fn_name, None)
-                if callable(fn):
-                    self.root.after(0, fn)
-
-            for _ in range(self.auto_interval.get() * 10):
-                if not self.auto_var.get():
-                    return
-                time.sleep(0.1)
-
     # ── Security scan ─────────────────────────────────────────────────────────
 
-    def _build_scan_launcher(self, parent):
-        """Security scan launch button at the bottom of the left panel."""
-        outer, body = section_frame(parent, "SECURITY SCAN")
-        outer.pack(fill="x", pady=(0, 6))
-        styled_btn(
-            body, "[ RUN SECURITY SCAN ]",
-            self.open_security_scan, color=RED,
-        ).pack(fill="x")
-
-    def _build_threat_simulator(self, parent):
-        """
-        THREAT SIMULATOR panel — injects fake threat data to the Nextion display
-        so you can see how each page looks when things go wrong.
-
-        Two scenarios:
-            Malware  — fake high-risk processes and suspicious open ports
-            DDoS     — CPU/RAM/disk spike with network quality collapse
-        """
-        outer, body = section_frame(parent, "THREAT SIMULATOR")
-        outer.pack(fill="x", pady=(0, 6))
-
-        tk.Label(
-            body, text="Pushes fake threat data to the display.",
-            bg=BG2, fg=TEXT_DIM, font=FONT_MONO_SM, anchor="w",
-        ).pack(fill="x", pady=(0, 6))
-
-        btn_row = tk.Frame(body, bg=BG2)
-        btn_row.pack(fill="x", pady=(0, 4))
-
-        styled_btn(
-            btn_row, "MALWARE SIM",
-            self._sim_malware, color=RED, width=12,
-        ).pack(side="left", padx=(0, 4))
-
-        styled_btn(
-            btn_row, "DDoS SIM",
-            self._sim_ddos, color=YELLOW, width=12,
-        ).pack(side="left")
-
-        styled_btn(
-            body, "[ CLEAR SIM ]",
-            self._sim_clear, color=TEXT_DIM,
-        ).pack(fill="x", pady=(4, 0))
-
-    # ── Threat simulation ─────────────────────────────────────────────────────
-
-    def _sim_malware(self):
-        """
-        Simulate a malware infection scenario on page_procs.
-
-        Navigates to page_procs then pushes four fake high-risk processes
-        into the name, score, and flag elements.
-        """
-        if not self.ser:
-            self.log("Sim: not connected.", "error")
-            return
-        self.log("[ SIM ] Malware scenario starting...", "info")
-        threading.Thread(target=self._run_sim_malware, daemon=True).start()
-
-    def _run_sim_malware(self):
-        # Navigate to the procs page so the data is visible
-        self._send_raw_cmd("page page_procs")
-        time.sleep(0.6)
-
-        fake_procs = [
-            (
-                "svch0st.exe",
-                "92/100",
-                "name looks like hex string; running from temp dir",
-            ),
-            (
-                "xvzqtbmf.exe",
-                "85/100",
-                "very high name entropy — looks randomly generated",
-            ),
-            (
-                "winlogon32.exe",
-                "71/100",
-                "not running from a standard system directory",
-            ),
-            (
-                "a3f9b2c1.exe",
-                "63/100",
-                "path could not be resolved — process may be hidden",
-            ),
-        ]
-        name_els  = ["t2",  "t9",  "t15", "t13"]
-        score_els = ["t6",  "t10", "t16", "t12"]
-        flag_els  = ["t7",  "t8",  "t14", "t11"]
-
-        for i, (name, score, flag) in enumerate(fake_procs):
-            self._send_raw_cmd(f'{name_els[i]}.txt="{name}"')
-            self._send_raw_cmd(f'{score_els[i]}.txt="{score}"')
-            self._send_raw_cmd(f'{flag_els[i]}.txt="{flag}"')
-
-        self._queue_log("[ SIM ] Malware: procs page injected", "ok")
-
-    def _sim_ddos(self):
-        """
-        Simulate a DDoS attack scenario on page_network.
-
-        Navigates to page_network then collapses quality score, latency,
-        packet loss, speeds, and internet status.
-        """
-        if not self.ser:
-            self.log("Sim: not connected.", "error")
-            return
-        self.log("[ SIM ] DDoS scenario starting...", "info")
-        threading.Thread(target=self._run_sim_ddos, daemon=True).start()
-
-    def _run_sim_ddos(self):
-        from config import QUALITY_GAUGE
-
-        # Navigate to the network page so the data is visible
-        self._send_raw_cmd("page page_network")
-        time.sleep(0.6)
-
-        self._send_raw_cmd(f'{QUALITY_GAUGE}.val=4')
-        self._send_raw_cmd(f'{QUALITY_GAUGE}.pco={NX_RED}')
-        self._send_raw_cmd('t5.txt="4"')
-        self._send_raw_cmd('t3.txt="850ms"')
-        self._send_raw_cmd('t7.txt="75%"')
-        self._send_raw_cmd('int_status.txt="Degraded"')
-        self._send_raw_cmd(f'int_status.pco={NX_RED}')
-        self._send_raw_cmd('dwnld_status.txt="0.1 Mbps"')
-        self._send_raw_cmd('upld_status.txt="0.0 Mbps"')
-
-        self._queue_log("[ SIM ] DDoS: network page injected", "ok")
-
-    def _sim_clear(self):
-        """
-        Clear all simulated data by re-running the real refresh for the
-        current page, restoring live values.
-        """
-        if not self.ser:
-            self.log("Sim: not connected.", "error")
-            return
-        self.log("[ SIM ] Clearing — refreshing current page with live data...", "info")
-        if self._current_page:
-            self._on_page_change(self._current_page)
-        else:
-            self.log("[ SIM ] No active page to refresh.", "info")
-
     def open_security_scan(self):
-        """Open the security scan Toplevel window."""
+        """Open the security scan Toplevel window.
+
+        Triggered from the RUN SECURITY SCAN button in the title bar.
+        """
         SecurityScanWindow(self.root)
 
     # ── Setup sequence ────────────────────────────────────────────────────────

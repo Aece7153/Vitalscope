@@ -18,14 +18,12 @@
 #   from security_scan import SecurityScanWindow
 #   SecurityScanWindow(parent)
 
-import os
 import subprocess
 import re
-import time
-import socket
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import time
 import psutil
 from datetime import datetime
 
@@ -35,38 +33,10 @@ from config import (
     TEXT, TEXT_DIM, TEXT_HEAD,
     FONT_MONO, FONT_MONO_SM, FONT_LABEL, FONT_HEAD, FONT_TITLE,
     NX_GREEN, NX_RED, NX_YELLOW,
+    KNOWN_SAFE_PROCESSES,
 )
 from ui_widgets import styled_btn
 from ai_analysis import analyse as ai_analyse
-
-
-# ── Known-safe process whitelist ───────────────────────────────────────────────
-# Process names here (lowercase, filename only, no path) are considered trusted.
-# Anything NOT in this set gets flagged as "unknown" — not necessarily malicious,
-# but worth a manual review. Add your own regularly-used apps as needed.
-
-KNOWN_SAFE_PROCESSES = frozenset({
-    # Core Windows system processes
-    "system", "system idle process", "registry", "smss.exe", "csrss.exe",
-    "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe",
-    "dwm.exe", "explorer.exe", "taskhostw.exe", "sihost.exe", "fontdrvhost.exe",
-    "ctfmon.exe", "spoolsv.exe", "searchindexer.exe", "wuauclt.exe",
-    "msiexec.exe", "conhost.exe", "dllhost.exe", "runtimebroker.exe",
-    "applicationframehost.exe", "shellexperiencehost.exe",
-    "startmenuexperiencehost.exe", "securityhealthservice.exe",
-    "securityhealthsystray.exe", "msmpeng.exe", "nissrv.exe",
-    "smartscreen.exe", "wlanext.exe", "audiodg.exe", "dashost.exe",
-    "wermgr.exe", "wevtutil.exe",
-    # Common browsers & productivity apps
-    "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe",
-    "code.exe", "python.exe", "pythonw.exe", "cmd.exe", "powershell.exe",
-    "windowsterminal.exe", "notepad.exe", "notepad++.exe", "7zfm.exe",
-    "discord.exe", "slack.exe", "teams.exe", "zoom.exe", "spotify.exe",
-    "onedrive.exe", "dropbox.exe", "googledrivefs.exe",
-    "taskmgr.exe", "mmc.exe", "regedit.exe", "mspaint.exe", "calc.exe",
-    # Dev / serial / network tools commonly used with this project
-    "thonny.exe", "putty.exe", "hxd.exe", "wireshark.exe",
-})
 
 
 # ── Scan functions (no GUI dependencies) ──────────────────────────────────────
@@ -75,8 +45,8 @@ def scan_processes():
     """
     Enumerate running processes and flag any not in KNOWN_SAFE_PROCESSES.
 
-    Uses 'tasklist /FO CSV /NH' for names and memory, then cross-references
-    psutil to resolve the full executable path for each flagged PID.
+    Uses a single psutil.process_iter pass for name, pid, exe path, and RSS
+    memory — avoids spawning 'tasklist' and parsing its CSV output.
 
     Returns:
         {
@@ -93,37 +63,31 @@ def scan_processes():
         }
     """
     try:
-        result = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=15,
-        )
         flagged = []
         total   = 0
 
-        # Build a pid→path map from psutil in one pass (faster than per-PID lookups)
-        pid_path_map = {}
-        for proc in psutil.process_iter(["pid", "exe"]):
+        for proc in psutil.process_iter(["pid", "name", "exe", "memory_info"]):
             try:
-                pid_path_map[proc.info["pid"]] = proc.info["exe"]
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+                info = proc.info
+                name = info.get("name") or ""
+                if not name:
+                    continue
+                total += 1
 
-        for line in result.stdout.strip().splitlines():
-            parts = [p.strip('"') for p in line.split('","')]
-            if len(parts) < 5:
-                continue
-            total += 1
-            name   = parts[0].lower()
-            pid    = int(parts[1]) if parts[1].isdigit() else 0
-            mem_kb = int(re.sub(r"[^\d]", "", parts[4])) if parts[4] else 0
+                if name.lower() in KNOWN_SAFE_PROCESSES:
+                    continue
 
-            if name not in KNOWN_SAFE_PROCESSES:
+                mem_info = info.get("memory_info")
+                mem_kb   = (mem_info.rss // 1024) if mem_info else 0
+
                 flagged.append({
-                    "name":   parts[0],
-                    "pid":    pid,
+                    "name":   name,
+                    "pid":    info.get("pid") or 0,
                     "mem_kb": mem_kb,
-                    "path":   pid_path_map.get(pid),
+                    "path":   info.get("exe"),
                 })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
         return {"flagged": flagged, "total": total, "error": None}
 
@@ -304,15 +268,12 @@ def scan_firewall():
         result["adapters"] = adapters
 
         # ── Listening ports ───────────────────────────────────────────────────
-        tl = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=10,
-        )
         pid_map = {}
-        for line in tl.stdout.strip().splitlines():
-            parts = [p.strip('"') for p in line.split('","')]
-            if len(parts) >= 2 and parts[1].isdigit():
-                pid_map[int(parts[1])] = parts[0]
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid_map[proc.info["pid"]] = proc.info.get("name") or "Unknown"
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
 
         ns = subprocess.run(
             ["netstat", "-ano"], capture_output=True, text=True, timeout=15
@@ -962,7 +923,6 @@ class SecurityScanWindow:
         Background worker: drives the analyse() generator and streams each line
         to the text widget via frame.after() for thread safety.
         """
-        import time as _time
         nextion_lines = []
         overall_label = "?"
 
@@ -972,7 +932,7 @@ class SecurityScanWindow:
             if line.startswith("  •") and len(nextion_lines) < 6:
                 nextion_lines.append(line.strip())
             self.frame.after(0, self._append_ai_line, line)
-            _time.sleep(0.012)
+            time.sleep(0.012)
 
         self.frame.after(0, self._ai_analysis_done, overall_label, nextion_lines)
 
@@ -1014,15 +974,13 @@ class SecurityScanWindow:
             ai_rating.pco  — colour matching the risk level
             t_ai_log.txt   — scrolling findings (updated line by line)
         """
-        import time as _time
-        from config import NX_GREEN, NX_YELLOW, NX_RED
         color = NX_RED if "HIGH" in overall_label else (NX_YELLOW if "MODERATE" in overall_label else NX_GREEN)
         self.send_fn(f'ai_rating.txt="{overall_label}"')
         self.send_fn(f"ai_rating.pco={color}")
         for line in findings:
             truncated = line[:40] if len(line) > 40 else line
             self.send_fn(f't_ai_log.txt="{truncated}"')
-            _time.sleep(0.3)
+            time.sleep(0.3)
 
     # ── Nextion integration ───────────────────────────────────────────────────
 

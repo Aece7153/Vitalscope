@@ -11,10 +11,12 @@
 # in real time. Each yielded string is a single line (no trailing newline).
 
 import math
-import os
 import re
-import string
-from collections import Counter
+
+# Unified process scorer — single source of truth for 0–100 risk scoring.
+# ai_analysis previously reimplemented this locally with a slightly different
+# signal set; we now delegate to the canonical scorer in heuristic.py.
+from heuristic import score_process_summary as _score_process
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,38 +44,6 @@ RISKY_PORT_COMBOS = [
     ({3389, 445}, "RDP + SMB — EternalBlue / BlueKeep attack surface combined"),
 ]
 
-# Suspicious path fragments (lowercase)
-SUSPICIOUS_PATH_FRAGMENTS = [
-    "\\temp\\",
-    "\\tmp\\",
-    "\\appdata\\roaming\\",
-    "\\appdata\\local\\temp\\",
-    "\\users\\public\\",
-    "\\recycle",
-    "\\programdata\\",   # legitimate but worth noting when unnamed
-    "\\downloads\\",
-    "\\desktop\\",
-]
-
-# Extensions that should almost never be a running process path
-SUSPICIOUS_EXTENSIONS = {".tmp", ".dat", ".log", ".txt", ".bat", ".vbs", ".ps1"}
-
-# Common legit process name patterns (regex, lowercase)
-LEGIT_NAME_PATTERNS = [
-    r"^[a-z]+svc\.exe$",          # e.g. spoolsvc.exe
-    r"^[a-z]+host\.exe$",          # e.g. svchost.exe
-    r"^[a-z]+(mgr|mgmt)\.exe$",   # e.g. taskmgr.exe
-    r"^[a-z]+\.exe$",              # single word — generic but common
-]
-
-# Memory thresholds
-MEM_HIGH_KB    = 500_000   #  ~488 MB — flagged as high
-MEM_EXTREME_KB = 1_500_000 # ~1.4 GB — flagged as extreme
-
-# Entropy thresholds for name randomness scoring
-ENTROPY_SUSPICIOUS  = 3.5   # above this → looks random
-ENTROPY_VERY_RANDOM = 4.2   # above this → almost certainly generated
-
 # Risk score thresholds for overall rating
 RISK_LOW      = 25
 RISK_MODERATE = 50
@@ -83,170 +53,8 @@ RISK_HIGH     = 75
 # ─────────────────────────────────────────────────────────────────────────────
 #  Utility helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _entropy(s: str) -> float:
-    """
-    Shannon entropy of a string — measures randomness / unpredictability.
-
-    A score of 0 means all characters are the same (e.g. "aaaa").
-    A score near 4–5 means the characters look randomly distributed,
-    similar to what a malware name generator would produce.
-    """
-    if not s:
-        return 0.0
-    counts = Counter(s)
-    length = len(s)
-    return -sum((c / length) * math.log2(c / length) for c in counts.values())
-
-
-def _strip_ext(name: str) -> str:
-    """Return the filename stem without extension, lowercase."""
-    return os.path.splitext(name.lower())[0]
-
-
-def _name_looks_random(name: str) -> tuple[bool, float, str]:
-    """
-    Heuristic check for whether a process name looks machine-generated.
-
-    Returns (suspicious: bool, entropy: float, reason: str).
-
-    Signals checked:
-      - High Shannon entropy on the stem
-      - Long runs of consonants with no vowels
-      - Digit-heavy names (e.g. "a3f9b2c1.exe")
-      - Very short stems that are all consonants
-      - Names that look like hex strings
-    """
-    stem = _strip_ext(name)
-    if len(stem) < 2:
-        return False, 0.0, ""
-
-    ent = _entropy(stem)
-    reasons = []
-
-    if ent >= ENTROPY_VERY_RANDOM:
-        reasons.append(f"very high name entropy ({ent:.2f}) — looks randomly generated")
-    elif ent >= ENTROPY_SUSPICIOUS:
-        reasons.append(f"elevated name entropy ({ent:.2f}) — unusual character distribution")
-
-    vowels = set("aeiou")
-    consonant_run = max(
-        (len(m.group()) for m in re.finditer(r"[^aeiou]{4,}", stem)),
-        default=0,
-    )
-    if consonant_run >= 5:
-        reasons.append(f"long consonant run ({consonant_run} chars, no vowels)")
-
-    digit_ratio = sum(c.isdigit() for c in stem) / len(stem)
-    if digit_ratio > 0.4:
-        reasons.append(f"name is {digit_ratio:.0%} digits — unusual for a real program")
-
-    if re.fullmatch(r"[0-9a-f]{6,}", stem):
-        reasons.append("name looks like a hex string")
-
-    if len(stem) <= 4 and not any(c in vowels for c in stem):
-        reasons.append("very short all-consonant stem")
-
-    return bool(reasons), ent, "; ".join(reasons)
-
-
-def _path_suspicion(path: str | None) -> list[str]:
-    """
-    Return a list of concern strings for a process's executable path.
-
-    An empty list means the path looks normal.
-    """
-    if not path:
-        return ["executable path could not be resolved — process may be hidden or SYSTEM-level"]
-
-    p = path.lower()
-    concerns = []
-
-    for frag in SUSPICIOUS_PATH_FRAGMENTS:
-        if frag in p:
-            concerns.append(f"running from suspicious location: {frag.strip(chr(92))}")
-            break
-
-    ext = os.path.splitext(p)[1]
-    if ext in SUSPICIOUS_EXTENSIONS:
-        concerns.append(f"process image has unusual extension: {ext}")
-
-    # Signed system paths are generally safer
-    safe_roots = (
-        "c:\\windows\\", "c:\\program files\\", "c:\\program files (x86)\\"
-    )
-    if not any(p.startswith(r) for r in safe_roots):
-        concerns.append("not running from a standard system or program directory")
-
-    return concerns
-
-
-def _mem_verdict(mem_kb: int) -> tuple[str, str]:
-    """Return (severity, description) for a memory usage value in KB."""
-    mb = mem_kb // 1024
-    if mem_kb >= MEM_EXTREME_KB:
-        return "extreme", f"{mb} MB — extremely high for an unknown process"
-    if mem_kb >= MEM_HIGH_KB:
-        return "high", f"{mb} MB — above normal for an unknown process"
-    if mem_kb >= 100_000:
-        return "elevated", f"{mb} MB — moderately elevated"
-    return "normal", f"{mb} MB"
-
-
-def _score_process(proc: dict) -> tuple[int, list[str]]:
-    """
-    Score a single flagged process from 0 (clean) to 100 (very suspicious).
-
-    Returns (score, list_of_finding_strings).
-    """
-    score    = 0
-    findings = []
-    name     = proc.get("name", "")
-    mem_kb   = proc.get("mem_kb", 0)
-    path     = proc.get("path")
-
-    # ── Name randomness ───────────────────────────────────────────────────────
-    is_random, ent, name_reason = _name_looks_random(name)
-    if is_random:
-        increment = 30 if ent >= ENTROPY_VERY_RANDOM else 15
-        score += increment
-        findings.append(f"Name: {name_reason}")
-
-    # ── Path suspicion ────────────────────────────────────────────────────────
-    path_concerns = _path_suspicion(path)
-    for concern in path_concerns:
-        score += 20
-        findings.append(f"Location: {concern}")
-
-    # ── Memory usage ──────────────────────────────────────────────────────────
-    severity, mem_desc = _mem_verdict(mem_kb)
-    if severity == "extreme":
-        score += 25
-        findings.append(f"Memory: {mem_desc}")
-    elif severity == "high":
-        score += 15
-        findings.append(f"Memory: {mem_desc}")
-    elif severity == "elevated":
-        score += 5
-        findings.append(f"Memory: {mem_desc}")
-
-    # ── Name length extremes ──────────────────────────────────────────────────
-    stem = _strip_ext(name)
-    if len(stem) > 25:
-        score += 10
-        findings.append(f"Name: unusually long process name ({len(stem)} chars)")
-    elif len(stem) <= 2:
-        score += 15
-        findings.append(f"Name: suspiciously short ({len(stem)} chars)")
-
-    # ── Numeric-only or symbol-heavy names ────────────────────────────────────
-    printable_ratio = sum(c in string.printable for c in stem) / max(len(stem), 1)
-    if printable_ratio < 0.8:
-        score += 20
-        findings.append("Name: contains non-printable characters")
-
-    return min(score, 100), findings
-
+# Process scoring (_score_process) is imported from heuristic.py above —
+# per-process risk scoring lives in one place now.
 
 def _outlier_memory_processes(flagged: list[dict]) -> list[dict]:
     """
@@ -288,7 +96,7 @@ def _port_analysis(listeners: list[dict]) -> list[str]:
             findings.append(f"Port combination risk: {message}")
 
     # Unusually high total port count
-    risky_count = len([p for p in open_ports if p in HIGH_RISK_PORTS])
+    risky_count = sum(1 for p in open_ports if p in HIGH_RISK_PORTS)
     if risky_count >= 5:
         findings.append(
             f"{risky_count} high-risk ports open simultaneously — significant attack surface"
@@ -489,7 +297,6 @@ def analyse(scan_results: dict):
     yield ""
 
     risky_procs = [(p, s, f) for p, s, f in scored if s >= 40]
-    clean_procs = [(p, s, f) for p, s, f in scored if s < 20]
 
     yield f"  {total} processes running — {len(flagged)} not in trusted whitelist."
 
@@ -668,7 +475,7 @@ def _build_recommendations(
             name    = profile.group(1) if profile else "unknown"
             recs.append(
                 f"Re-enable the '{name}' firewall profile immediately. "
-                "Run: netsh advfirewall set {name.lower()}profile state on"
+                f"Run: netsh advfirewall set {name.lower()}profile state on"
             )
 
     # High-risk processes

@@ -120,15 +120,15 @@ def get_speed_mbps(stop_flag=None):
         try:
             start = time.time()
             total = 0
-            req   = urllib.request.urlopen(url, timeout=8)
 
-            while total < MAX_BYTES:
-                if stop_flag and stop_flag():
-                    return 0.0, 0.0
-                chunk = req.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                total += len(chunk)
+            with urllib.request.urlopen(url, timeout=8) as req:
+                while total < MAX_BYTES:
+                    if stop_flag and stop_flag():
+                        return 0.0, 0.0
+                    chunk = req.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
 
             elapsed = time.time() - start
 
