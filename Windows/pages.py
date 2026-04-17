@@ -1,5 +1,6 @@
 # pages.py
 # Page refresh logic for each Nextion screen.
+# (Mixin for NextionControlStation — see app.py)
 # Implemented as a mixin class — NextionControlStation inherits from this.
 #
 # Adding a new page:
@@ -13,13 +14,20 @@ import time
 from config import (
     NX_GREEN, NX_RED, NX_YELLOW, NX_BLACK,
     PING_HOST, PING_INTERVAL, QUALITY_GAUGE,
+    PROCS_REFRESH_INTERVAL,
 )
 from network_utils import (
     check_internet, get_dns_servers, get_speed_mbps,
     count_local_devices, check_port, get_network_quality,
 )
 from security_scan import scan_firewall, scan_processes
-from ai_analysis import _score_process
+from ai_analysis import (
+    _score_process,
+    EXPECTED_PORT_OWNERS,
+    _SUSPICIOUS_PORT_PROCESSES,
+    _REGISTERED_PORT_MIN,
+    _EPHEMERAL_PORT_MIN,
+)
 
 
 class PageHandlersMixin:
@@ -184,7 +192,9 @@ class PageHandlersMixin:
     # Parallel score elements — receive the bare numeric risk score for the same rank.
     PORTSCAN_SCORE_ELEMENTS = ["t21", "t22", "t25", "t80", "t443", "t53", "t3389"]
 
-    # Per-port risk scores (0–100).
+    # Per-port base risk scores (0–100).
+    # These reflect the intrinsic danger of a port being open, independent of
+    # which process owns it.  Process context is applied as a boost below.
     PORT_RISK_SCORES = {
         21:   85,   # FTP  — cleartext credentials, widely exploited
         22:   70,   # SSH  — brute-force target
@@ -205,13 +215,48 @@ class PageHandlersMixin:
         8443: 35,   # HTTPS alt
     }
 
-    _DEFAULT_PORT_SCORE = 30
-
     HIGH_RISK_PORTS = frozenset(PORT_RISK_SCORES.keys())
 
-    def _port_risk_score(self, port: int) -> int:
-        """Return the 0–100 risk score for a given port number."""
-        return self.PORT_RISK_SCORES.get(port, self._DEFAULT_PORT_SCORE)
+    def _port_risk_score(self, port: int, process: str = "") -> int:
+        """
+        Return a 0–100 risk score for a port, incorporating:
+
+          1. Base score — per-port intrinsic risk from PORT_RISK_SCORES.
+          2. Port range defaults — for ports not in the table:
+               >= 49152  ephemeral/dynamic range    → base 10  (low risk)
+               1024–49151 registered range          → base 25  (moderate scrutiny)
+               < 1024     well-known, unrecognised  → base 40  (elevated concern)
+          3. Process-context boost:
+               shell / LOLBin owns the port         → +35 (always a red flag)
+               known port with wrong process owner  → +25 (unexpected binding)
+        """
+        proc_lower = process.lower() if process else ""
+
+        # ── Process-context boost ────────────────────────────────────────────
+        proc_boost = 0
+        if proc_lower in _SUSPICIOUS_PORT_PROCESSES:
+            # Shell/scripting engine listening on any port is a major red flag
+            proc_boost = 35
+        elif port in EXPECTED_PORT_OWNERS and proc_lower:
+            expected = EXPECTED_PORT_OWNERS[port]
+            if proc_lower not in expected and proc_lower != "unknown":
+                # Known port, but the wrong process is owning it
+                proc_boost = 25
+
+        # ── Base score ───────────────────────────────────────────────────────
+        base = self.PORT_RISK_SCORES.get(port)
+        if base is not None:
+            return min(100, base + proc_boost)
+
+        # Port not in the known table — use range-based default
+        if port >= _EPHEMERAL_PORT_MIN:
+            base = 10   # dynamic/private range — low risk by design
+        elif port >= _REGISTERED_PORT_MIN:
+            base = 25   # registered range — warrants scrutiny
+        else:
+            base = 40   # well-known range, unrecognised service
+
+        return min(100, base + proc_boost)
 
     def page_portscan_refresh(self):
         """Kick off the dynamic portscan in a background thread."""
@@ -246,10 +291,10 @@ class PageHandlersMixin:
                 self.send(f'{el}.txt=""')
             return
 
-        # Score and sort highest risk first
+        # Score and sort highest risk first — process name feeds into scoring
         scored = sorted(
             listeners,
-            key=lambda e: self._port_risk_score(e["port"]),
+            key=lambda e: self._port_risk_score(e["port"], e.get("process", "")),
             reverse=True,
         )
         top7 = scored[:len(self.PORTSCAN_ELEMENTS)]
@@ -258,8 +303,8 @@ class PageHandlersMixin:
             self.PORTSCAN_ELEMENTS, self.PORTSCAN_SCORE_ELEMENTS, top7
         ):
             port    = entry["port"]
-            score   = self._port_risk_score(port)
             process = entry.get("process") or "Unknown"
+            score   = self._port_risk_score(port, process)
 
             if len(process) > 14:
                 process = process[:13] + "~"
@@ -282,10 +327,10 @@ class PageHandlersMixin:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  PAGE: PROCS
+    #  PAGE: PROCS   (Nextion emits "page_proc" — see PAGE_REFRESH_MAP)
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Parallel Nextion element lists — one entry per display row (8 rows total).
+    # Parallel Nextion element lists — one entry per display row (4 rows total).
     # All three lists share the same rank index, so row 0 is the highest-scored
     # process, row 1 the next, and so on.
     PROCS_NAME_ELEMENTS  = ["t2",  "t9",  "t15", "t13"]
@@ -293,26 +338,69 @@ class PageHandlersMixin:
     PROCS_FLAG_ELEMENTS  = ["t7",  "t8",  "t14", "t11"]
 
     def page_procs_refresh(self):
-        """Kick off the process scan and scoring in a background thread."""
+        """
+        Run the process scan once on page-enter, then start a 2-minute
+        auto-refresh loop so the displayed rows stay fresh while the user
+        lingers on the page.
+        """
         self._queue_log("  [procs] starting process scan...", "dim")
         threading.Thread(target=self._run_procs, daemon=True).start()
+        self._start_procs_loop()
+
+    # ── Procs auto-refresh loop ─────────────────────────────────────────────
+
+    def _start_procs_loop(self):
+        """Start the 2-minute auto-refresh loop (no-op if already running)."""
+        # Guard against module-reload scenarios where attributes are missing
+        if not hasattr(self, "_procs_stop_event"):
+            self._procs_stop_event = threading.Event()
+            self._procs_running    = False
+            self._procs_thread     = None
+
+        if self._current_page not in ("proc", "procs") or self._procs_running:
+            return
+
+        self._procs_stop_event.clear()
+        self._procs_running = True
+        self._procs_thread  = threading.Thread(
+            target=self._procs_refresh_loop, daemon=True
+        )
+        self._procs_thread.start()
+        self._queue_log(
+            f"  [procs] auto-refresh started ({int(PROCS_REFRESH_INTERVAL)}s)",
+            "dim",
+        )
+
+    def _stop_procs_loop(self):
+        """Signal the procs loop to stop. Returns immediately (non-blocking)."""
+        if hasattr(self, "_procs_stop_event"):
+            self._procs_stop_event.set()
+        self._procs_running = False
+
+    def _procs_refresh_loop(self):
+        """
+        Re-run the procs scan every PROCS_REFRESH_INTERVAL seconds while the
+        user is on the procs page. The initial scan is kicked off by
+        page_procs_refresh(), so this loop sleeps first and then refreshes.
+        """
+        while not self._procs_stop_event.is_set():
+            # Interruptible sleep — wakes immediately if stop is signalled
+            self._procs_stop_event.wait(timeout=PROCS_REFRESH_INTERVAL)
+            if self._procs_stop_event.is_set():
+                break
+            self._run_procs()
+
+        self._procs_running = False
+        self._queue_log("  [procs] auto-refresh stopped", "dim")
 
     def _run_procs(self):
         """
-        Background worker for the procs page.
+        Background worker: scan flagged processes, score and rank them, then
+        write the top-4 highest-risk rows to the Nextion procs page.
 
-        1. Runs scan_processes() to get all unknown (non-whitelisted) processes.
-        2. Scores each one with _score_process() from the AI analysis engine.
-        3. Sorts by score descending and writes the top 8 to three parallel
-           element lists on the Nextion:
-
-               PROCS_NAME_ELEMENTS  — truncated process name
-               PROCS_SCORE_ELEMENTS — numeric score (0–100)
-               PROCS_FLAG_ELEMENTS  — first flag reason, truncated to fit display
-
-        Unused rows in all three lists are cleared.
+        Uses the same scorer as the AI analysis tab so scores are consistent.
         """
-        self._queue_log("  [procs] running process scan...", "dim")
+        self._queue_log("  [procs] scanning processes...", "dim")
         proc_data = scan_processes()
 
         if proc_data.get("error"):
@@ -323,81 +411,64 @@ class PageHandlersMixin:
         flagged = proc_data.get("flagged", [])
         if not flagged:
             self._queue_log("  [procs] no unknown processes found", "dim")
-            self.send('t2.txt="All clear"')
-            for el in self.PROCS_NAME_ELEMENTS[1:] + self.PROCS_SCORE_ELEMENTS + self.PROCS_FLAG_ELEMENTS:
+            self.send('t2.txt="No unknown procs"')
+            for el in (
+                self.PROCS_NAME_ELEMENTS[1:]
+                + self.PROCS_SCORE_ELEMENTS
+                + self.PROCS_FLAG_ELEMENTS
+            ):
                 self.send(f'{el}.txt=""')
             return
 
-        # Score every flagged process and sort highest first
-        scored = []
-        for proc in flagged:
-            score, findings = _score_process(proc)
-            scored.append((proc, score, findings))
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        self._queue_log(
-            f"  [procs] scored {len(scored)} unknown process(es), "
-            f"displaying top {min(len(scored), len(self.PROCS_NAME_ELEMENTS))}",
-            "dim",
+        # Score and sort highest risk first
+        scored = sorted(
+            flagged,
+            key=lambda p: _score_process(p)[0],
+            reverse=True,
         )
+        top4 = scored[: len(self.PROCS_NAME_ELEMENTS)]
 
-        top8 = scored[:len(self.PROCS_NAME_ELEMENTS)]
-
-        for i, (proc, score, findings) in enumerate(top8):
-            name_el  = self.PROCS_NAME_ELEMENTS[i]
-            score_el = self.PROCS_SCORE_ELEMENTS[i]
-            flag_el  = self.PROCS_FLAG_ELEMENTS[i]
-
-            # Process name — full, no truncation
-            name = proc.get("name", "Unknown")
-
-            # Flag reason — first finding, category prefix stripped, full text
-            if findings:
-                raw_flag = findings[0]
-                if ": " in raw_flag:
-                    raw_flag = raw_flag.split(": ", 1)[1]
-                flag = raw_flag
-            else:
-                flag = "Not whitelisted"
-
+        for name_el, score_el, flag_el, proc in zip(
+            self.PROCS_NAME_ELEMENTS,
+            self.PROCS_SCORE_ELEMENTS,
+            self.PROCS_FLAG_ELEMENTS,
+            top4,
+        ):
+            score, reasons = _score_process(proc)
+            name = proc.get("name", "?")
+            if len(name) > 14:
+                name = name[:13] + "~"
+            flag = reasons[0][:16] if reasons else "Unknown"
             self.send(f'{name_el}.txt="{name}"')
-            self.send(f'{score_el}.txt="{score}/100"')
+            self.send(f'{score_el}.txt="{score}"')
             self.send(f'{flag_el}.txt="{flag}"')
-
             self._queue_log(
-                f'  [procs] row {i+1}: {name_el}="{name}"  '
-                f'{score_el}="{score}"  {flag_el}="{flag}"',
-                "dim",
+                f'  [procs] {name_el}="{name}"  {score_el}="{score}"', "dim"
             )
 
-        # Clear unused rows
-        for i in range(len(top8), len(self.PROCS_NAME_ELEMENTS)):
-            self.send(f'{self.PROCS_NAME_ELEMENTS[i]}.txt=""')
-            self.send(f'{self.PROCS_SCORE_ELEMENTS[i]}.txt=""')
-            self.send(f'{self.PROCS_FLAG_ELEMENTS[i]}.txt=""')
+        # Clear unused slots
+        for el in self.PROCS_NAME_ELEMENTS[len(top4) :]:
+            self.send(f'{el}.txt=""')
+        for el in self.PROCS_SCORE_ELEMENTS[len(top4) :]:
+            self.send(f'{el}.txt=""')
+        for el in self.PROCS_FLAG_ELEMENTS[len(top4) :]:
+            self.send(f'{el}.txt=""')
 
         self._queue_log(
-            f"  [procs] done — {len(top8)} process(es) written to display", "ok"
+            f"  [procs] done — {len(top4)} process(es) written to display", "ok"
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────
     #  PAGE: LOCK
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────
 
     def page_lock_refresh(self):
-        """Flash t0 red/black three times as a lock-screen visual indicator."""
-        threading.Thread(target=self._lock_flash, daemon=True).start()
-
-    def _lock_flash(self):
         """
-        Background worker — alternates t0 between red and black three times.
+        Called when the Nextion navigates to the lock page.
 
-        Aborts early if the user navigates away from the lock page mid-flash.
+        Stops any running background loops (network quality, procs auto-refresh)
+        so they do not continue consuming resources while the display is locked.
         """
-        self._queue_log("  [lock] flashing t0...", "dim")
-        for _ in range(3):
-            for color in (NX_RED, NX_BLACK):
-                if self._current_page != "lock":
-                    return
-                self.send(f"t0.bco={color}")
-                time.sleep(0.3)
+        self._queue_log("  [lock] page active — stopping background loops", "dim")
+        self._stop_net_loop()
+        self._stop_procs_loop()

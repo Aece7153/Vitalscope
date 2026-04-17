@@ -49,6 +49,45 @@ RISK_LOW      = 25
 RISK_MODERATE = 50
 RISK_HIGH     = 75
 
+# ── Port range boundaries (IANA) ──────────────────────────────────────────────
+_REGISTERED_PORT_MIN = 1024   # 1024–49151: registered / user ports
+_EPHEMERAL_PORT_MIN  = 49152  # 49152–65535: dynamic / private / ephemeral
+
+# ── Expected legitimate process owners per well-known port ───────────────────
+# Values are frozensets of lowercase process names that are normal owners.
+# Any other process bound to that port is suspicious and warrants a finding.
+EXPECTED_PORT_OWNERS: dict[int, frozenset] = {
+    22:   frozenset({"sshd.exe", "openssh.exe"}),
+    53:   frozenset({"svchost.exe", "dns.exe"}),
+    80:   frozenset({"svchost.exe", "w3wp.exe", "httpd.exe", "nginx.exe",
+                     "inetinfo.exe", "apache.exe", "apache2.exe"}),
+    135:  frozenset({"svchost.exe"}),
+    139:  frozenset({"system"}),
+    389:  frozenset({"lsass.exe"}),
+    443:  frozenset({"svchost.exe", "w3wp.exe", "httpd.exe", "nginx.exe",
+                     "inetinfo.exe", "apache.exe", "apache2.exe"}),
+    445:  frozenset({"system"}),
+    636:  frozenset({"lsass.exe"}),
+    1433: frozenset({"sqlservr.exe"}),
+    1434: frozenset({"sqlservr.exe"}),
+    3306: frozenset({"mysqld.exe", "mysqld-nt.exe"}),
+    3389: frozenset({"svchost.exe"}),
+    5985: frozenset({"svchost.exe"}),
+    5986: frozenset({"svchost.exe"}),
+    8080: frozenset({"svchost.exe", "w3wp.exe", "httpd.exe", "nginx.exe",
+                     "java.exe", "javaw.exe", "tomcat.exe", "node.exe"}),
+    8443: frozenset({"svchost.exe", "w3wp.exe", "httpd.exe", "nginx.exe",
+                     "java.exe", "javaw.exe", "tomcat.exe", "node.exe"}),
+}
+
+# ── Processes that are inherently suspicious when owning a listening socket ───
+# Shell engines and LOLBins should never be bound to a port — almost always C2.
+_SUSPICIOUS_PORT_PROCESSES = frozenset({
+    "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe", "certutil.exe",
+    "bitsadmin.exe", "msbuild.exe",
+})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Utility helpers
@@ -77,25 +116,89 @@ def _port_analysis(listeners: list[dict]) -> list[str]:
     """
     Analyse listening ports for individual risks and dangerous combinations.
 
+    Evaluation layers (in priority order):
+      1. Process identity — shell/LOLBin owning ANY port is a critical C2 indicator.
+      2. Port/process reputation — compare bound process against EXPECTED_PORT_OWNERS;
+         a database port bound to sqlservr.exe is fine; the same port bound to
+         powershell.exe or an unknown process is a major red flag.
+      3. Port range context — ephemeral ports (>=49152) are low-risk by default;
+         registered ports (1024–49151) that aren't in the known table still warrant
+         a note if owned by a non-system process.
+      4. Dangerous port combinations (unchanged).
+
     Returns a list of finding strings.
     """
-    findings = []
+    findings   = []
     open_ports = {lst["port"] for lst in listeners}
+    reported   = set()   # avoid double-reporting the same (port, process) pair
 
-    # Individual high-risk ports
     for lst in listeners:
-        port    = lst["port"]
-        process = lst.get("process", "Unknown")
-        if port in HIGH_RISK_PORTS and port not in BENIGN_PORTS:
-            desc = _port_description(port)
-            findings.append(f"Port {port} ({desc}) is open — bound to {process}")
+        port            = lst["port"]
+        process_raw     = lst.get("process", "Unknown")
+        process         = process_raw.lower()
+        desc            = _port_description(port)
+        key             = (port, process)
 
-    # Dangerous combinations
+        if key in reported:
+            continue
+
+        # ── Layer 1: shell / LOLBin owning any listening socket ───────────────
+        if process in _SUSPICIOUS_PORT_PROCESSES:
+            findings.append(
+                f"CRITICAL: Port {port} ({desc}) is bound to '{process_raw}' — "
+                f"shell/scripting processes must never own a listening socket "
+                f"(likely C2 backdoor or reverse shell)"
+            )
+            reported.add(key)
+            continue
+
+        # ── Layer 2: known port — check expected process owner ────────────────
+        if port in EXPECTED_PORT_OWNERS:
+            expected = EXPECTED_PORT_OWNERS[port]
+            if process not in expected and process not in ("unknown", ""):
+                # Unexpected owner — severity depends on port sensitivity
+                severity = (
+                    "CRITICAL"
+                    if port in {445, 1433, 3306, 3389}
+                    else "WARNING"
+                )
+                expected_str = ", ".join(sorted(expected))
+                findings.append(
+                    f"{severity}: Port {port} ({desc}) bound to unexpected process "
+                    f"'{process_raw}' — expected owner(s): {expected_str}"
+                )
+            elif port in HIGH_RISK_PORTS and port not in BENIGN_PORTS:
+                # Correct owner but port is still high-risk — note it
+                findings.append(
+                    f"Port {port} ({desc}) is open — bound to {process_raw}"
+                )
+            reported.add(key)
+            continue
+
+        # ── Layer 3a: high-risk port without an owner table entry ─────────────
+        if port in HIGH_RISK_PORTS and port not in BENIGN_PORTS:
+            findings.append(f"Port {port} ({desc}) is open — bound to {process_raw}")
+            reported.add(key)
+            continue
+
+        # ── Layer 3b: registered port (1024–49151) not in the known table ─────
+        # Ephemeral ports (>=49152) are the dynamic/private range — low risk by
+        # design (short-lived client sockets).  Only flag registered ports that
+        # aren't owned by a core system process.
+        if _REGISTERED_PORT_MIN <= port < _EPHEMERAL_PORT_MIN:
+            if process not in {"svchost.exe", "system", "lsass.exe"}:
+                findings.append(
+                    f"Registered port {port} listening — bound to '{process_raw}' "
+                    f"(not a known service port; verify this is expected)"
+                )
+            reported.add(key)
+
+    # ── Dangerous port combinations ───────────────────────────────────────────
     for combo, message in RISKY_PORT_COMBOS:
         if combo.issubset(open_ports):
             findings.append(f"Port combination risk: {message}")
 
-    # Unusually high total port count
+    # ── Unusually high total port count ───────────────────────────────────────
     risky_count = sum(1 for p in open_ports if p in HIGH_RISK_PORTS)
     if risky_count >= 5:
         findings.append(
@@ -420,10 +523,10 @@ def analyse(scan_results: dict):
             yield f"  • {finding}"
     yield ""
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────
     #  Firewall analysis
-    # ─────────────────────────────────────────────────────────────────────────
-    yield "── FIREWALL ANALYSIS ───────────────────────────────────────"
+    # ────────────────────────────────────────────────────────────────────────────
+    yield "── FIREWALL ANALYSIS ───────────────────────────────────────────"
     yield ""
 
     if not fw_findings:
@@ -433,10 +536,10 @@ def analyse(scan_results: dict):
             yield f"  • {finding}"
     yield ""
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────────
     #  Prioritised recommendations
-    # ─────────────────────────────────────────────────────────────────────────
-    yield "── RECOMMENDATIONS ─────────────────────────────────────────"
+    # ────────────────────────────────────────────────────────────────────────────
+    yield "── RECOMMENDATIONS ─────────────────────────────────────────────"
     yield ""
 
     recs = _build_recommendations(scored, port_findings, user_findings, fw_findings, outliers)

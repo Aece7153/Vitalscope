@@ -22,6 +22,7 @@ import math
 import os
 import re
 import string
+import time
 from collections import Counter
 
 from config import KNOWN_SAFE_PROCESSES
@@ -101,6 +102,14 @@ _ENTROPY_VERY_RANDOM = 4.2    # very high — almost certainly generated
 _MEM_ELEVATED_KB = 100_000    # ~97  MB
 _MEM_HIGH_KB     = 500_000    # ~488 MB
 _MEM_EXTREME_KB  = 1_500_000  # ~1.4 GB
+
+# Installation recency thresholds (days).
+# On Windows, os.stat().st_ctime returns the file creation time — a reliable
+# proxy for when an executable was first installed.  Newer programs carry
+# elevated risk because malware is almost always freshly dropped.
+_AGE_VERY_RECENT = 7    # +15 pts — installed this week
+_AGE_RECENT      = 30   # +8  pts — installed this month
+_AGE_MODERATE    = 90   # +4  pts — installed in the last quarter
 
 # Printable character set (cached — avoids Python recomputing per call)
 _PRINTABLE = frozenset(string.printable)
@@ -338,7 +347,35 @@ def score_process(proc: dict) -> dict:
         score += 5
         reasons.append(f"Elevated memory usage: {mem_kb // 1024} MB")
 
-    # ── Clamp and label ──────────────────────────────────────────────────────
+    # ── Signal: recently installed executable ────────────────────────────────
+    # On Windows, st_ctime is the file *creation* time — a reliable proxy for
+    # when the executable was first placed on disk (installed / dropped).
+    # Malware is almost always freshly written; long-established binaries are
+    # far less likely to be malicious.  We only check when a path is available.
+    if path:
+        try:
+            age_days = (time.time() - os.stat(path).st_ctime) / 86_400.0
+            if age_days < _AGE_VERY_RECENT:
+                score += 15
+                reasons.append(
+                    f"Executable created very recently ({int(age_days)}d ago) — "
+                    "newly dropped files are a primary malware indicator"
+                )
+            elif age_days < _AGE_RECENT:
+                score += 8
+                reasons.append(
+                    f"Executable installed recently ({int(age_days)}d ago) — "
+                    "verify this program is expected"
+                )
+            elif age_days < _AGE_MODERATE:
+                score += 4
+                reasons.append(
+                    f"Executable installed within the last 90 days ({int(age_days)}d ago)"
+                )
+        except (OSError, PermissionError, ValueError):
+            pass   # path exists but stat failed (e.g. access denied) — skip
+
+    # ── Clamp and label ────────────────────────────────────────────────────────────────────────────
     score = min(score, 100)
 
     if score >= 70:

@@ -11,7 +11,7 @@ DEFAULT_DELAY = 0.12    # seconds to wait between consecutive serial writes
 # Paste your Discord webhook URL here, or leave blank and enter it in the UI.
 # Format: https://discord.com/api/webhooks/<id>/<token>
 
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1494356518009831464/WwkZ_kH3KbgdkzYwxdG3K6jz1X_yMkSE2b1k7micNTq7F5ff4bDtzhdTTbi8Tfgg_Z5a"
+DISCORD_WEBHOOK_URL = "URL"
 # ── Always-on monitor settings ────────────────────────────────────────────────
 
 RESOURCE_POLL_INTERVAL  = 5.0    # seconds between CPU/RAM/disk polls
@@ -31,15 +31,6 @@ HIGH_RISK_PORTS_SET = frozenset({
 })
 
 # ── Known-safe process whitelist ───────────────────────────────────────────────
-# Process names here (lowercase, filename only, no path) are considered trusted.
-# Anything NOT in this set gets flagged as "unknown" — not necessarily malicious,
-# but worth a manual review. Add your own regularly-used apps as needed.
-#
-# This is the single source of truth for "safe process names" across the app:
-#   - security_scan.scan_processes() uses it to filter the flagged list.
-#   - heuristic._SAFE_BASE_NAMES is derived from it (extensions stripped)
-#     for typosquat distance checks.
-
 KNOWN_SAFE_PROCESSES = frozenset({
     # Core Windows system processes
     "system", "system idle process", "registry", "smss.exe", "csrss.exe",
@@ -70,52 +61,45 @@ PING_INTERVAL  = 3.0      # seconds between network quality score updates
 QUALITY_GAUGE  = "j0"     # Nextion progress-bar element that shows quality score
 
 # ── Nextion RGB565 colour constants ───────────────────────────────────────────
-# RGB565 encodes colour as: (R[4:0] << 11) | (G[5:0] << 5) | B[4:0]
-# These values match the Nextion editor's built-in colour palette.
 
-NX_GREEN  = 11648   # bright green  — used for "connected / ok" states
-NX_RED    = 63488   # bright red    — used for "error / disconnected" states
-NX_YELLOW = 65504   # bright yellow — used for "warning / caution" states
-NX_GREY   = 33840   # mid grey      — used for inactive / placeholder text
-NX_WHITE  = 65535   # white
-NX_BLACK  = 0       # black
+NX_GREEN  = 11648
+NX_RED    = 63488
+NX_YELLOW = 65504
+NX_GREY   = 33840
+NX_WHITE  = 65535
+NX_BLACK  = 0
 
 # ── Page → refresh function map ───────────────────────────────────────────────
-# Keys must exactly match the page name the Nextion prints (after "page_").
-# Values are lists of method names on NextionControlStation that will be called
-# in order whenever that page becomes active.
-#
-# To add a new page:
-#   1. Add its entry here.
-#   2. Implement page_<name>_refresh() in pages.py.
-#   3. Add the page name to PAGE_NAMES in pico_bridge.py.
 
 PAGE_REFRESH_MAP = {
-    "main":      ["page_dashboard_refresh"],  # Pico boots to the main page
+    "main":      ["page_dashboard_refresh"],
     "dashboard": ["page_dashboard_refresh"],
     "network":   ["page_network_refresh"],
     "portscan":  ["page_portscan_refresh"],
+    "proc":      ["page_procs_refresh"],      # Nextion prints "page_proc"
+    "procs":     ["page_procs_refresh"],      # accept either spelling
     "lock":      ["page_lock_refresh"],
 }
 
-# ── GUI colour palette ────────────────────────────────────────────────────────
-# All Tkinter colours. Edit here to restyle the whole application at once.
+# ── Procs page auto-refresh interval ──────────────────────────────────────────
+PROCS_REFRESH_INTERVAL = 120.0   # seconds (2 minutes)
 
-BG        = "#0d0f12"   # main window background
-BG2       = "#13161b"   # panel / section background
-BG3       = "#1a1e26"   # widget / card background
-BORDER    = "#252a35"   # subtle border lines
-ACCENT    = "#00e5ff"   # primary highlight (cyan)
-ACCENT2   = "#ff6b35"   # secondary highlight (orange)
-GREEN     = "#39ff14"   # status: OK / connected
-RED       = "#ff3131"   # status: error / disconnected
-YELLOW    = "#ffd600"   # status: warning / caution
-TEXT      = "#c8d0e0"   # normal text
-TEXT_DIM  = "#4a5568"   # de-emphasised / label text
-TEXT_HEAD = "#e8edf5"   # heading / card-name text
+# ── GUI colour palette ────────────────────────────────────────────────────────
+
+BG        = "#0d0f12"
+BG2       = "#13161b"
+BG3       = "#1a1e26"
+BORDER    = "#252a35"
+ACCENT    = "#00e5ff"
+ACCENT2   = "#ff6b35"
+GREEN     = "#39ff14"
+RED       = "#ff3131"
+YELLOW    = "#ffd600"
+TEXT      = "#c8d0e0"
+TEXT_DIM  = "#4a5568"
+TEXT_HEAD = "#e8edf5"
 
 # ── Font tuples ───────────────────────────────────────────────────────────────
-# Tkinter font tuples: (family, size[, style])
 
 FONT_MONO    = ("Consolas", 9)
 FONT_MONO_SM = ("Consolas", 8)

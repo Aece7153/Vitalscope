@@ -83,6 +83,11 @@ class NextionControlStation(PageHandlersMixin):
         self._dash_thread     = None
         self._dash_stop_event = threading.Event()
 
+        # ── Procs page 2-minute auto-refresh loop ─────────────────────────────
+        self._procs_running    = False
+        self._procs_thread     = None
+        self._procs_stop_event = threading.Event()
+
         self._apply_style()
         self._build_ui()
         self._refresh_ports()
@@ -392,21 +397,25 @@ class NextionControlStation(PageHandlersMixin):
             f"[SEC SCAN] Complete — {ports} listening port(s) found", "info")
 
     def _build_setup_panel(self, parent):
-        """Run Setup Sequence button — navigates to a page and sweeps gauges."""
-        outer, body = section_frame(parent, "SETUP SEQUENCE")
+        """
+        TEST MALWARE SIGNATURE panel — pushes four hand-crafted fake malware
+        examples to the Nextion procs page (page_proc) with different scores
+        and reasons, showcasing the heuristic engine's detection signals.
+
+        (Replaces the former SETUP SEQUENCE panel.)
+        """
+        outer, body = section_frame(parent, "TEST MALWARE SIGNATURE")
         outer.pack(fill="x", pady=(0, 6))
 
-        row = tk.Frame(body, bg=BG2)
-        row.pack(fill="x")
-        styled_label(row, "PAGE:").pack(side="left", padx=(0, 4))
-        self.setup_page_entry = styled_entry(row, width=10)
-        self.setup_page_entry.insert(0, "home")
-        self.setup_page_entry.pack(side="left")
+        tk.Label(
+            body,
+            bg=BG2, fg=TEXT_DIM, font=FONT_MONO_SM, justify="left", anchor="w",
+        ).pack(fill="x", pady=(0, 6))
 
         styled_btn(
-            body, "[ RUN SETUP ANIMATION ]",
-            self.run_setup_sequence, color=ACCENT2,
-        ).pack(fill="x", pady=(6, 0))
+            body, "[ TEST MALWARE SIGNATURE ]",
+            self.run_test_malware_signature, color=ACCENT2,
+        ).pack(fill="x", pady=(2, 0))
 
     def _build_custom_cmd_panel(self, parent):
         """Free-text entry for sending arbitrary Nextion commands."""
@@ -672,6 +681,9 @@ class NextionControlStation(PageHandlersMixin):
             self._stop_net_loop()
         if page_name not in ("dashboard", "main"):
             self._stop_dash_loop()
+        if page_name not in ("proc", "procs"):
+            # Stop the 2-minute procs auto-refresh when leaving the page
+            self._stop_procs_loop()
 
         prev_page          = self._current_page
         self._current_page = page_name
@@ -704,7 +716,6 @@ class NextionControlStation(PageHandlersMixin):
                 fn()
 
     # ── Dashboard live update loop ────────────────────────────────────────────
-
     def _stop_dash_loop(self):
         """Signal the dashboard loop to stop. Returns immediately (non-blocking)."""
         self._dash_stop_event.set()
@@ -734,7 +745,6 @@ class NextionControlStation(PageHandlersMixin):
         self._queue_log("  [dashboard] live loop stopped", "dim")
 
     # ── Serial send helpers ───────────────────────────────────────────────────
-
     def _send_raw_cmd(self, cmd: str) -> bool:
         """
         Write one command to serial (thread-safe, no Tkinter calls).
@@ -864,40 +874,131 @@ class NextionControlStation(PageHandlersMixin):
         """
         SecurityScanWindow(self.root)
 
-    # ── Setup sequence ────────────────────────────────────────────────────────
-
-    def run_setup_sequence(self):
+    # ── Test malware signature ────────────────────────────────────────────────
+    
+    def run_test_malware_signature(self):
         """
-        Navigate to a target page, set pc_status, and sweep gauges 0→100→0.
+        Push 4 hand-crafted fake malware samples to the Nextion page_procs
+        screen. Each sample uses a different heuristic signal (double
+        extension, typosquatting, GUID-like name, no-vowel entropy) with a
+        matching 0–100 score so the demo exercises the full range of the
+        scorer's reasoning on-screen.
 
-        Runs in a background thread so the UI stays responsive during the animation.
-        Guard: no-op if serial is not connected.
+        Delegates to PageHandlersMixin.push_test_malware_signatures, which
+        handles the page navigation and the row writes in a background thread
+        so the UI stays responsive. Guard: no-op if serial is not connected.
         """
         if not self.ser:
-            self.log("Not connected — cannot run setup.", "error")
+            self.log("Not connected — cannot push test signatures.", "error")
             return
 
-        page = self.setup_page_entry.get().strip() or "home"
+        self.log("Running Test Malware Signature demo on page_procs...", "info")
+        self.push_test_malware_signatures()
+    
+    def push_test_malware_signatures(self):
+        """
+        Navigate to page_procs and inject 4 synthetic malware samples directly
+        into the Nextion element triplets, bypassing the live scanner.
 
-        def _run():
-            self.send(f"page {page}")
-            time.sleep(0.3)
-            self.send('pc_status.txt="Connected"')
-            self.send(f"pc_status.pco={NX_GREEN}")
-            self.send("pc_con.val=1")
+        Each sample is designed to exercise a distinct heuristic signal path
+        from heuristic.py so the demo covers the full range of scorer reasoning:
 
-            # Sweep 0 → 100 → 0 in steps of 20, avoiding the duplicate 100 step
-            sweep = list(range(0, 101, 20)) + list(range(80, -1, -20))
-            for i in sweep:
-                self.send(f"g_cpu.val={i}")
-                self.send(f"g_ram.val={i}")
-                self.send(f"g_disk.val={i}")
-                time.sleep(0.08)
+        Row 0 — svch0st.exe          Typosquatting (svchost + hex char swap)
+        Row 1 — invoice.pdf.exe      Double extension (.pdf.exe)
+        Row 2 — a3f9b2c1d4e5f6.exe   Hex-string name + GUID-pattern
+        Row 3 — xkzqvtbmf.exe        High entropy + long consonant run
 
-            self.send_all_sys()
-            self._queue_log("Setup sequence complete.", "ok")
+        Scores are pre-computed to reflect what heuristic.score_process() would
+        return for each sample's combined signal stack.
 
-        threading.Thread(target=_run, daemon=True).start()
+        Runs in a daemon thread — UI stays responsive during the write burst.
+        """
+        threading.Thread(target=self._run_test_malware_signatures, daemon=True).start()
+
+    def _run_test_malware_signatures(self):
+        # Navigate to the procs page first so elements exist on screen
+        self._send_raw_cmd("page page_procs")
+        time.sleep(0.6)
+
+    # ── Fake samples ──────────────────────────────────────────────────────
+    # Each tuple: (name, score, primary_reason)
+    #
+    # Reasons are drawn directly from heuristic.py's reasons list format
+    # so they read identically to live scan output on the display.
+    #
+    # Signal stacks that produce each score:
+    #
+    # "svch0st.exe"
+    #   +35  typosquatting — 1 edit from "svchost"
+    #   +25  suspicious directory (AppData\Roaming)
+    #   +10  not in Program Files / Windows root
+    #   +10  elevated name entropy (digit substitution raises it)
+    #   +12  high memory (612 MB)
+    #   +5   recently installed (18d)
+    #   = 97 (clamped to 97)
+    #
+    # "invoice.pdf.exe"
+    #   +30  double extension (.pdf.exe)
+    #   +25  suspicious directory (Downloads)
+    #   +10  not in trusted root
+    #   +15  executable created very recently (2d)
+    #   +8   high memory (520 MB)
+    #   +2   small entropy contribution from short stem
+    #   = 90
+    #
+    # "a3f9b2c1d4e5f6.exe"
+    #   +22  GUID/hash-like name pattern
+    #   +15  hex-string name match
+    #   +22  very high name entropy (4.31)
+    #   +20  no executable path resolved
+    #   +10  digit-heavy name (> 40% digits)
+    #   = 89 (clamped)
+    #
+    # "xkzqvtbmf.exe"
+    #   +22  very high name entropy (4.28)
+    #   +12  very few vowels (vowel_ratio_score → 1.0)
+    #   +10  long consonant run (8 chars, no vowels)
+    #   +25  suspicious directory (Temp)
+    #   +10  not in trusted root
+    #   +8   recently installed (22d)
+    #   = 87
+    #
+        SAMPLES = [
+            (
+                "svch0st.exe",
+                "97/100",
+                "Typosquatting svchost.exe (1 edit, digit swap)",
+            ),
+            (
+                "invoice.pdf.exe",
+                "90/100",
+                "Double extension (.pdf.exe) + dropped to Downloads",
+            ),
+            (
+                "a3f9b2c1d4e5f6.exe",
+                "89/100",
+                "GUID/hex name + no path resolved (process hiding)",
+            ),
+            (
+                "xkzqvtbmf.exe",
+                "87/100",
+                "Very high entropy + 8-char consonant run, no vowels",
+            ),
+        ]
+
+        name_els  = ["t2",  "t9",  "t15", "t13"]
+        score_els = ["t6",  "t10", "t16", "t12"]
+        flag_els  = ["t7",  "t8",  "t14", "t11"]
+
+        for i, (name, score, reason) in enumerate(SAMPLES):
+            self._send_raw_cmd(f'{name_els[i]}.txt="{name}"')
+            self._send_raw_cmd(f'{score_els[i]}.txt="{score}"')
+            self._send_raw_cmd(f'{flag_els[i]}.txt="{reason}"')
+            self._queue_log(
+                f'  [sim] row {i+1}: {name}  {score}  {reason}', "dim"
+            )
+
+        self._queue_log("[ SIM ] Malware signatures pushed to page_procs", "ok")
 
     # ── Log ───────────────────────────────────────────────────────────────────
 
